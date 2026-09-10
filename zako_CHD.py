@@ -1,6 +1,12 @@
 import json
 import base64
-
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+import base64
+import json
 
 """
 zako 签到助手 —— 适配CHD
@@ -19,8 +25,19 @@ import sys
 import threading
 import uuid
 import requests
-import tkinter as tk
-import customtkinter as ctk
+# ---- 环境判断函数先定义 ----
+def is_headless_env():
+    if os.environ.get("CHAOXING_CLI") == "1":
+        return True
+    if sys.platform.startswith("linux"):
+        if not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
+            return True
+    return False
+
+# ---- 只在有 GUI 的环境才 import tkinter ----
+if not is_headless_env():
+    import tkinter as tk
+    import customtkinter as ctk
 from playwright.async_api import async_playwright
 from datetime import datetime, timezone, timedelta, time
 
@@ -91,15 +108,33 @@ def load_credentials():
 
     return username, password
 
-async def login_and_get_cookie(log=print, username=None, password=None, headless=None):
+
+def login_and_get_cookie(log=print):
     """
-    自动登录。
-    - username/password: 若为 None，则从 env/config.json/input 获取
-    - headless: 若为 None，自动判断（CLI 模式为 True，GUI 模式为 False）
+    使用 Selenium 自动登录长安大学畅课，返回 (cookie_str, student_id)
     """
-    # ---- 1. 获取账号密码 ----
+    import time as _time
+    from selenium import webdriver
+    from selenium.webdriver.chrome.options import Options
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+
+    # ========== 1. 获取账号密码 ==========
+    username = os.environ.get("CHAOXING_USERNAME", "").strip()
+    password = os.environ.get("CHAOXING_PASSWORD", "").strip()
+
+    config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
     if not username or not password:
-        username, password = load_credentials()
+        if os.path.exists(config_path):
+            try:
+                with open(config_path, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+                username = cfg.get("USERNAME", "").strip()
+                password = cfg.get("PASSWORD", "").strip()
+            except Exception as e:
+                log(f"⚠️ 读取 config.json 失败: {e}")
+
     if not username or not password:
         if is_headless_env():
             log("❌ 呜呜呜，咱没有找到账号密码呢喵...请主人在 config.json 中配置 CHAOXING_USERNAME / CHAOXING_PASSWORD喵！")
@@ -114,118 +149,128 @@ async def login_and_get_cookie(log=print, username=None, password=None, headless
                 json.dump({"USERNAME": username, "PASSWORD": password}, f, ensure_ascii=False, indent=2)
             log(f"✅ 账号被咱藏在了 {config_path}呢~咱保证一定会保守秘密的喵！")
 
-    # ---- 2. 决定 headless ----
-    if headless is None:
-        headless = is_headless_env()
-    log(f"根据主人的设备，咱决定选择: {'无头' if headless else '有头'}模式启动自己哦~(注：在有头模式的时候请主人不要乱动咱启动的浏览器哦~否则咱会找不到界面的呜呜，乱动的话咱咬你哦ww)")
+    # ========== 2. 配置 Chrome 选项 ==========
+    options = Options()
+    headless = os.environ.get("CHAOXING_CLI") == "1" or is_headless_env()
+    if headless:
+        options.add_argument("--headless")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--window-size=1920,1080")
+    options.add_argument("--ignore-certificate-errors")
+    options.add_experimental_option("excludeSwitches", ["enable-logging"])
 
-    async with async_playwright() as p:
-        browser = None
-        for channel in ["msedge", "chrome"]:
+    driver = None
+    try:
+        # ========== 3. 启动浏览器 ==========
+        log(f"根据主人的设备，咱决定选择: {'无头' if headless else '有头'}模式启动自己哦~(注：在有头模式的时候请主人不要乱动咱启动的浏览器哦~否则咱会找不到界面的呜呜，乱动的话咱咬你哦ww)")
+        driver = webdriver.Chrome(options=options)
+
+        # ========== 4. 打开畅课首页 ==========
+        log("🌐 已经打开主人的Tronclass首页啦！")
+        driver.get(BASE_URL)
+        WebDriverWait(driver, 15).until(
+            EC.presence_of_element_located((By.TAG_NAME, "body"))
+        )
+        log(f"📍 zako现在在 {driver.current_url}里面找东西呢~")
+
+        # ========== 5. 检查是否已登录 ==========
+        cookies_now = {c["name"]: c["value"] for c in driver.get_cookies()}
+        if "role_token" not in cookies_now:
+            log("🔓 主人似乎没有登录呢~让咱帮主人登录一下吧！")
+
+            # 点击首页“登录”按钮
             try:
-                browser = await p.chromium.launch(headless=headless, channel=channel)
-                break
-            except Exception:
-                continue
-        if browser is None:
-            browser = await p.chromium.launch(headless=headless)
-
-        context = await browser.new_context()
-        page = await context.new_page()
-
-        try:
-            # ---- 3. 打开首页 ----
-            log("🌐 已经打开主人的Tronclass首页啦！")
-            await page.goto(BASE_URL, wait_until="networkidle", timeout=25000)
-            await asyncio.sleep(1)
-
-            # ---- 4. 检查是否已登录 ----
-            cookies = await context.cookies()
-            has_role_token = any(c["name"] == "role_token" for c in cookies)
-
-            if not has_role_token:
-                log("🔓 主人似乎没有登录呢~让咱帮主人登录一下吧！")
-                clicked = await _click_login_button(page, log)
-
-                if not clicked:
-                    log("⚠️ 呜呜，坏学校把登录按钮藏在了zako找不到的地方呢！咱直接访问 /user/courses 了哦，失礼失礼~")
-                    try:
-                        await page.goto(f"{BASE_URL}/user/courses", wait_until="commit", timeout=15000)
-                    except Exception:
-                        pass
-                    await asyncio.sleep(1)
-
-                # ---- 5. CAS 表单填写 ----
-                if "ids.chd.edu.cn" in page.url or "authserver" in page.url:
-                    log("🔐 找到统一认证页了呢，奋笔疾书中...")
-                    await _fill_cas_form(page, username, password, log)
-                elif "role_token" in await page.evaluate("() => document.cookie"):
-                    log("ℹ️ 欸?主人原来已经帮zako登录过了吗?谢谢主人喵~~")
-                else:
-                    log(f"ℹ️ zako正在  {page.url} 里面找东西呢~")
-                    if headless:
-                        log("❌ 呜喵，坏学校似乎使用了某种未知力量，当前无头模式下zako无法帮主人输入喵...")
-                        await browser.close()
-                        return None, None
-                    log("⚠️ ww麻烦主人帮zako手动登录一下嘛，谢谢~")
-                    await browser.close()
-                    browser = await p.chromium.launch(headless=False, channel="msedge")
-                    context = await browser.new_context()
-                    page = await context.new_page()
-                    await page.goto(BASE_URL, wait_until="commit")
-                    await page.wait_for_function(
-                        "() => document.cookie.includes('role_token')",
-                        timeout=180000
+                login_btn = WebDriverWait(driver, 10).until(
+                    EC.element_to_be_clickable(
+                        (By.XPATH, "//a[contains(text(), '登录')]")
                     )
+                )
+                login_btn.click()
+            except Exception:
+                log("⚠️ 呜呜，坏学校把登录按钮藏在了zako找不到的地方呢！咱直接访问 /user/courses 了哦，失礼失礼~")
+                driver.get(f"{BASE_URL}/user/courses")
 
-            # ---- 6. 等页面稳定 + 提取 Cookie ----
-            log("⏳ 等待页面跳转中...zako先去玩一会毛线球哦>w<")
+            # ========== 6. 等待 CAS 表单出现 ==========
+            log("⏳ 等待 CAS 登录页加载...zako先去玩一会毛线球喵~ >w<")
+            WebDriverWait(driver, 20).until(
+                EC.presence_of_element_located((By.ID, "username"))
+            )
+            log("🔐 找到统一认证页了呢！")
+            _time.sleep(0.5)
+
+            # ========== 7. 填写表单 ==========
+            log("📝 奋笔疾书中...")
+            username_field = driver.find_element(By.ID, "username")
+            password_field = driver.find_element(By.ID, "password")
+
+            username_field.clear()
+            username_field.send_keys(username)
+            log("✅ 写完用户名啦！")
+
+            password_field.clear()
+            password_field.send_keys(password)
+            log("✅ 密码已填入！")
+
+            _time.sleep(0.5)
+
+            # 登录按钮是 <a id="login_submit">
+            login_submit = driver.find_element(By.ID, "login_submit")
+            login_submit.click()
+            log("✅ 找到登录按钮啦！")
+
+            # ========== 8. 等待登录完成 ==========
+            log("⏳ 等待登录跳转...zako先去喝一杯咖啡咯~")
+            WebDriverWait(driver, 30).until(
+                lambda d: any(c["name"] == "role_token" for c in d.get_cookies())
+            )
+            log("✅ 检测到 role_token，登录成功啦！")
+        else:
+            log("ℹ️ 欸?主人原来已经帮zako登录过了吗?谢谢主人喵~~")
+
+        # ========== 9. 提取 Cookie ==========
+        cookies = driver.get_cookies()
+        cookie_str = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
+        log(f"✅ 找到 {len(cookies)} 个 Cookie了呢，看上去好好吃~")
+
+        # ========== 10. 解析 role_token 中的 uid ==========
+        student_id = None
+        for item in cookie_str.split(";"):
+            item = item.strip()
+            if item.startswith("role_token="):
+                token = item.split("=", 1)[1]
+                parts = token.split(".")
+                if len(parts) >= 2:
+                    for part in [parts[0], parts[1]]:
+                        try:
+                            decoded = part + "=" * (4 - len(part) % 4)
+                            decoded = decoded.replace("-", "+").replace("_", "/")
+                            data = json.loads(base64.b64decode(decoded))
+                            uid = data.get("uid")
+                            if uid:
+                                student_id = str(uid)
+                                log(f"✅ 吃饼干的时候，发现主人的学生ID: {student_id}了呢~")
+                                break
+                        except Exception:
+                            continue
+                break
+
+        if not student_id:
+            log("⚠️ 呜呜呜...吃完饼干也没有发现主人的学生ID呢qwq")
+
+        return cookie_str, student_id
+
+    except Exception as e:
+        log(f"❌ 呜呜呜...登录出现未知错误了呢TwT: {e}")
+        return None, None
+    finally:
+        if driver:
             try:
-                await page.wait_for_url(f"{BASE_URL}/**", timeout=20000, wait_until="commit")
+                driver.quit()
             except Exception:
                 pass
-            await asyncio.sleep(2)
-
-            cookies = await context.cookies()
-            cookie_str = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
-            log(f"✅ 找到 {len(cookies)} 个 Cookie了呢，看上去好好吃~")
-
-            # ---- 7. 解析 uid ----
-            student_id = None
-            for item in cookie_str.split(";"):
-                item = item.strip()
-                if item.startswith("role_token="):
-                    token = item.split("=", 1)[1]
-                    parts = token.split(".")
-                    if len(parts) >= 2:
-                        for part in [parts[0], parts[1]]:
-                            try:
-                                decoded = part + "=" * (4 - len(part) % 4)
-                                decoded = decoded.replace("-", "+").replace("_", "/")
-                                data = json.loads(base64.b64decode(decoded))
-                                uid = data.get("uid")
-                                if uid:
-                                    student_id = str(uid)
-                                    log(f"✅ 吃饼干的时候，发现主人的学生ID: {student_id}了呢~")
-                                    break
-                            except Exception:
-                                continue
-                    break
-
-            await browser.close()
-
-            if not student_id and not headless:
-                student_id = input("学生ID: ").strip()
-
-            return cookie_str, student_id
-
-        except Exception as e:
-            log(f"❌ 呜呜呜...登录出现未知错误了呢TwT: {e}")
-            try:
-                await browser.close()
-            except Exception:
-                pass
-            return None, None
+            log("🔒 浏览器溜走了qwq")
 
 
 async def _click_login_button(page, log):
@@ -1147,899 +1192,960 @@ def fmt_time(value):
 # ==============================================================================
 # 主应用
 # ==============================================================================
+if not is_headless_env():
 
-class ZakoApp(ctk.CTk):
-    def __init__(self):
-        super().__init__()
+    class ZakoApp(ctk.CTk):
+        def __init__(self):
+            super().__init__()
 
-        # ── 窗口基础设置 ─────────────────────────────
-        ctk.set_appearance_mode("dark")
-        ctk.set_default_color_theme("dark-blue")
-        self.title("Zako 签到助手 ❤")
-        self.geometry("500x700")
-        self.resizable(False, False)
-        self.configure(fg_color=BG)
+            # ── 窗口基础设置 ─────────────────────────────
+            ctk.set_appearance_mode("dark")
+            ctk.set_default_color_theme("dark-blue")
+            self.title("Zako 签到助手 ❤")
+            self.geometry("500x700")
+            self.resizable(False, False)
+            self.configure(fg_color=BG)
 
-        png_candidates = [
-            os.path.join(getattr(sys, "_MEIPASS", ""), "assets", "nekonn.png"),
-            os.path.join(getattr(sys, "_MEIPASS", ""), "nekonn.png"),
-            os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "nekonn.png"),
-            os.path.join(os.path.dirname(os.path.abspath(__file__)), "nekonn.png"),
-        ]
-        ico_candidates = [
-            os.path.join(getattr(sys, "_MEIPASS", ""), "assets", "nekonn.ico"),
-            os.path.join(getattr(sys, "_MEIPASS", ""), "nekonn.ico"),
-            os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "nekonn.ico"),
-            os.path.join(os.path.dirname(os.path.abspath(__file__)), "nekonn.ico"),
-        ]
-        def _apply_icon():
-            for p in png_candidates:
-                if os.path.exists(p):
-                    try:
-                        self._icon_photo = tk.PhotoImage(file=p)
-                        self.iconphoto(True, self._icon_photo)
-                        break
-                    except Exception:
-                        pass
-            for p in ico_candidates:
-                if os.path.exists(p):
-                    try:
-                        self.iconbitmap(p)
-                        break
-                    except Exception:
-                        pass
-        _apply_icon()
-        self.after(200, _apply_icon)
+            png_candidates = [
+                os.path.join(getattr(sys, "_MEIPASS", ""), "assets", "nekonn.png"),
+                os.path.join(getattr(sys, "_MEIPASS", ""), "nekonn.png"),
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "nekonn.png"),
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), "nekonn.png"),
+            ]
+            ico_candidates = [
+                os.path.join(getattr(sys, "_MEIPASS", ""), "assets", "nekonn.ico"),
+                os.path.join(getattr(sys, "_MEIPASS", ""), "nekonn.ico"),
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "nekonn.ico"),
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), "nekonn.ico"),
+            ]
 
-        # ── 共享状态 ─────────────────────────────────
-        self._cookie     = None
-        self._student_id = None
-        self._courses    = []
-        self._busy       = False        # 防止重复点击
-        self._radar_running = False
-        self._number_running = False
+            def _apply_icon():
+                for p in png_candidates:
+                    if os.path.exists(p):
+                        try:
+                            self._icon_photo = tk.PhotoImage(file=p)
+                            self.iconphoto(True, self._icon_photo)
+                            break
+                        except Exception:
+                            pass
+                for p in ico_candidates:
+                    if os.path.exists(p):
+                        try:
+                            self.iconbitmap(p)
+                            break
+                        except Exception:
+                            pass
 
-        # ── 日志缓冲 ─────────────────────────────────
-        self._log_lines  = []
+            _apply_icon()
+            self.after(200, _apply_icon)
 
-        # ── 根布局：顶栏 + 内容区 ─────────────────────
-        self._build_topbar()
-        self._content = ctk.CTkFrame(self, fg_color=BG)
-        self._content.pack(fill="both", expand=True, padx=0, pady=0)
+            # ── 共享状态 ─────────────────────────────────
+            self._cookie = None
+            self._student_id = None
+            self._courses = []
+            self._busy = False  # 防止重复点击
+            self._radar_running = False
+            self._number_running = False
 
-        # ── 日志抽屉（隐藏态，覆盖在内容区上方）────────
-        self._log_drawer_visible = False
-        self._build_log_drawer()
+            # ── 日志缓冲 ─────────────────────────────────
+            self._log_lines = []
 
-        # ── 初始页面 ──────────────────────────────────
-        self._show_home()
+            # ── 根布局：顶栏 + 内容区 ─────────────────────
+            self._build_topbar()
+            self._content = ctk.CTkFrame(self, fg_color=BG)
+            self._content.pack(fill="both", expand=True, padx=0, pady=0)
 
-    # ─────────────────────────────────────────────────────
-    # 顶栏
-    # ─────────────────────────────────────────────────────
-    def _build_topbar(self):
-        bar = ctk.CTkFrame(self, fg_color=SURFACE, height=48, corner_radius=0)
-        bar.pack(fill="x", side="top")
-        bar.pack_propagate(False)
-
-        make_label(bar, "❤ zako", size=15, color=ACCENT, bold=True).pack(
-            side="left", padx=16
-        )
-        ctk.CTkButton(
-            bar, text="📋 日志", width=72, height=30,
-            fg_color=SURFACE2, hover_color="#2E2C3F", text_color=TEXT_SEC,
-            font=("Microsoft YaHei", 12), corner_radius=8,
-            command=self._toggle_log_drawer,
-        ).pack(side="right", padx=12, pady=9)
-
-    # ─────────────────────────────────────────────────────
-    # 日志抽屉
-    # ─────────────────────────────────────────────────────
-    def _build_log_drawer(self):
-        self._drawer = ctk.CTkFrame(self, fg_color=SURFACE, corner_radius=0)
-        # 不 pack，靠 place 覆盖
-        self._log_text = ctk.CTkTextbox(
-            self._drawer,
-            fg_color="#0A0912", text_color=TEXT_SEC,
-            font=("Courier New", 11),
-            wrap="word", state="disabled",
-            corner_radius=8,
-        )
-        self._log_text.pack(fill="both", expand=True, padx=12, pady=(8, 12))
-
-        ctk.CTkButton(
-            self._drawer, text="✕ 关闭日志", width=120, height=28,
-            fg_color=SURFACE2, hover_color=ACCENT_DK, text_color=TEXT_SEC,
-            font=("Microsoft YaHei", 12), corner_radius=8,
-            command=self._toggle_log_drawer,
-        ).pack(pady=(0, 8))
-
-    def _toggle_log_drawer(self):
-        if self._log_drawer_visible:
-            self._drawer.place_forget()
+            # ── 日志抽屉（隐藏态，覆盖在内容区上方）────────
             self._log_drawer_visible = False
-        else:
-            self._drawer.place(relx=0, rely=0.08, relwidth=1, relheight=0.92)
-            self._log_drawer_visible = True
+            self._build_log_drawer()
 
-    def _log(self, msg: str):
-        """线程安全的日志写入（可从任意线程调用）。"""
-        self._log_lines.append(msg)
-        print(msg)
-        self.after(0, self._flush_log, msg)
+            # ── 初始页面 ──────────────────────────────────
+            self._show_home()
 
-    def _flush_log(self, msg: str):
-        self._log_text.configure(state="normal")
-        self._log_text.insert("end", msg + "\n")
-        self._log_text.see("end")
-        self._log_text.configure(state="disabled")
+        # ─────────────────────────────────────────────────────
+        # 顶栏
+        # ─────────────────────────────────────────────────────
+        def _build_topbar(self):
+            bar = ctk.CTkFrame(self, fg_color=SURFACE, height=48, corner_radius=0)
+            bar.pack(fill="x", side="top")
+            bar.pack_propagate(False)
 
-    # ─────────────────────────────────────────────────────
-    # 内容区切换（清空再重建）
-    # ─────────────────────────────────────────────────────
-    def _clear_content(self):
-        for w in self._content.winfo_children():
-            w.destroy()
-
-    # =======================================================
-    # 第 1 页：主页  ——  猫爪按钮
-    # =======================================================
-    def _show_home(self):
-        self._clear_content()
-        f = self._content
-
-        ctk.CTkFrame(f, fg_color=BG, height=60).pack()
-
-        make_label(f, "zako 签到助手", size=26, bold=True, anchor="center").pack()
-        make_label(f, "点击猫爪，开始喵~", size=13, color=TEXT_SEC, anchor="center").pack(pady=(4, 0))
-
-        ctk.CTkFrame(f, fg_color=BG, height=44).pack()
-
-        # 猫爪按钮主体
-        paw_frame = ctk.CTkFrame(
-            f, fg_color=SURFACE, width=180, height=180, corner_radius=90
-        )
-        paw_frame.pack()
-        paw_frame.pack_propagate(False)
-
-        paw_lbl = ctk.CTkLabel(
-            paw_frame, text="🐾", font=("Segoe UI Emoji", 80), fg_color="transparent"
-        )
-        paw_lbl.place(relx=0.5, rely=0.5, anchor="center")
-
-        # 点击 / 悬停效果
-        def on_enter(e):
-            if not self._busy:
-                paw_frame.configure(fg_color="#2A1F35")
-        def on_leave(e):
-            paw_frame.configure(fg_color=SURFACE)
-        def on_click(e):
-            if not self._busy:
-                self._start_login()
-
-        for w in (paw_frame, paw_lbl):
-            w.bind("<Enter>", on_enter)
-            w.bind("<Leave>", on_leave)
-            w.bind("<Button-1>", on_click)
-
-        ctk.CTkFrame(f, fg_color=BG, height=24).pack()
-
-        # 状态文字（动态更新）
-        self._home_status = make_label(
-            f, "", size=12, color=TEXT_SEC, anchor="center"
-        )
-        self._home_status.pack()
-
-        ctk.CTkFrame(f, fg_color=BG, height=20).pack()
-
-        make_label(
-            f, "厦大 CAS 畅课签到码查询工具 ❤",
-            size=11, color=TEXT_SEC, anchor="center"
-        ).pack(side="bottom", pady=16)
-
-    def _set_home_status(self, msg, color=TEXT_SEC):
-        self.after(0, lambda: self._home_status.configure(text=msg, text_color=color))
-
-    # ── 第1步：启动登录流程 ──────────────────────────────
-    def _start_login(self):
-        self._busy = True
-        self._set_home_status("正在启动浏览器，请稍候喵~❤")
-
-        def on_done(result, err):
-            if err or result is None:
-                self._log(f"❌ 登录异常: {err}")
-                self._busy = False
-                self._set_home_status("❌ 出错了，再试一次喵~", DANGER)
-                return
-
-            cookie, student_id = result
-            if not cookie or not student_id:
-                self._log("❌ 未能获取凭证或学生ID")
-                self._busy = False
-                self._set_home_status("❌ 未能获取凭证，再试一次喵~", DANGER)
-                return
-
-            self._cookie     = cookie
-            self._student_id = student_id
-            self._set_home_status("✅ 凭证就绪！正在拉取课程喵~", SUCCESS)
-            self._log("✅ 凭证获取成功，开始拉取课程列表...")
-
-            # 第2步：拉取学期信息 + 课程列表（同步，放子线程）
-            def fetch_courses():
-                s_id, y_id = get_current_semester_info(cookie, self._log)
-                return get_courses(cookie, s_id, y_id, self._log)
-
-            def on_courses(courses, err2):
-                self._busy = False
-                if err2 or not courses:
-                    self._log(f"❌ 课程拉取失败: {err2}")
-                    self._set_home_status("❌ 课程列表拉取失败喵哦~", DANGER)
-                    return
-                self._courses = courses
-                self._log(f"🎉 成功拉取到 {len(courses)} 门课程喵！即将载入课程列表喵~❤")
-                self._set_home_status(f"🎉 成功获取 {len(courses)} 门课程喵~❤", SUCCESS)
-                self.after(500, self._show_courses)
-
-            run_sync_in_thread(fetch_courses, on_courses)
-
-        run_async(login_and_get_cookie(log=self._log), on_done)
-
-    # =======================================================
-    # 第 2 页：课程列表
-    # =======================================================
-    def _auto_scan(self):
-        """一键扫描所有课程，检测签到并自动执行"""
-        if self._busy:
-            return
-        if not self._courses:
-            self._log("⚠️ 课程列表为空，主人是不是忘记登录了呜")
-            return
-
-        self._busy = True
-        self._log("🚀 开始查看所有课程，上班了呜呜呜...")
-
-        # 弹出一个扫描中的提示页面
-        self._clear_content()
-        f = self._content
-
-        hdr = ctk.CTkFrame(f, fg_color=BG)
-        hdr.pack(fill="x", padx=20, pady=(16, 8))
-        make_label(hdr, "🚀 自动扫描中", size=24, bold=True).pack(anchor="w")
-        make_label(hdr, "正在依次检查每门课程的签到状态，请稍候喵...",
-                   size=12, color=TEXT_SEC).pack(anchor="w", pady=(2, 0))
-        separator(f).pack(fill="x", padx=20, pady=6)
-
-        # 进度条
-        bar_frame = ctk.CTkFrame(f, fg_color=BG)
-        bar_frame.pack(fill="x", padx=20, pady=6)
-        self._scan_bar = ctk.CTkProgressBar(
-            bar_frame, width=460, mode="indeterminate",
-            progress_color=ACCENT, fg_color=SURFACE2
-        )
-        self._scan_bar.pack()
-        self._scan_bar.start()
-
-        # 结果滚动区
-        self._scan_log_box = ctk.CTkTextbox(
-            f, width=460, height=380,
-            fg_color="#0A0912", text_color=TEXT_SEC,
-            font=("Courier New", 11), wrap="word", state="disabled",
-            corner_radius=10,
-        )
-        self._scan_log_box.pack(padx=20, pady=6, fill="both", expand=True)
-
-        # 后台线程执行扫描
-        def work():
-            return auto_scan_all_courses(
-                self._cookie, self._student_id, self._courses,
-                log=self._scan_log
+            make_label(bar, "❤ zako", size=15, color=ACCENT, bold=True).pack(
+                side="left", padx=16
             )
+            ctk.CTkButton(
+                bar, text="📋 日志", width=72, height=30,
+                fg_color=SURFACE2, hover_color="#2E2C3F", text_color=TEXT_SEC,
+                font=("Microsoft YaHei", 12), corner_radius=8,
+                command=self._toggle_log_drawer,
+            ).pack(side="right", padx=12, pady=9)
 
-        def on_done(result, err):
-            self._busy = False
-            self.after(0, self._finish_auto_scan, result, err)
+        # ─────────────────────────────────────────────────────
+        # 日志抽屉
+        # ─────────────────────────────────────────────────────
+        def _build_log_drawer(self):
+            self._drawer = ctk.CTkFrame(self, fg_color=SURFACE, corner_radius=0)
+            # 不 pack，靠 place 覆盖
+            self._log_text = ctk.CTkTextbox(
+                self._drawer,
+                fg_color="#0A0912", text_color=TEXT_SEC,
+                font=("Courier New", 11),
+                wrap="word", state="disabled",
+                corner_radius=8,
+            )
+            self._log_text.pack(fill="both", expand=True, padx=12, pady=(8, 12))
 
-        run_sync_in_thread(work, on_done)
+            ctk.CTkButton(
+                self._drawer, text="✕ 关闭日志", width=120, height=28,
+                fg_color=SURFACE2, hover_color=ACCENT_DK, text_color=TEXT_SEC,
+                font=("Microsoft YaHei", 12), corner_radius=8,
+                command=self._toggle_log_drawer,
+            ).pack(pady=(0, 8))
 
-    def _scan_log(self, msg):
-        """扫描日志：同时写入全局日志和扫描窗口"""
-        self._log(msg)
-        self.after(0, self._append_scan_log, msg)
+        def _toggle_log_drawer(self):
+            if self._log_drawer_visible:
+                self._drawer.place_forget()
+                self._log_drawer_visible = False
+            else:
+                self._drawer.place(relx=0, rely=0.08, relwidth=1, relheight=0.92)
+                self._log_drawer_visible = True
 
-    def _append_scan_log(self, msg):
-        box = getattr(self, "_scan_log_box", None)
-        if box is None:
-            return
-        try:
-            if not box.winfo_exists():
+        def _log(self, msg: str):
+            """线程安全的日志写入（可从任意线程调用）。"""
+            self._log_lines.append(msg)
+            print(msg)
+            self.after(0, self._flush_log, msg)
+
+        def _flush_log(self, msg: str):
+            self._log_text.configure(state="normal")
+            self._log_text.insert("end", msg + "\n")
+            self._log_text.see("end")
+            self._log_text.configure(state="disabled")
+
+        # ─────────────────────────────────────────────────────
+        # 内容区切换（清空再重建）
+        # ─────────────────────────────────────────────────────
+        def _clear_content(self):
+            for w in self._content.winfo_children():
+                w.destroy()
+
+        # =======================================================
+        # 第 1 页：主页  ——  猫爪按钮
+        # =======================================================
+        def _show_home(self):
+            self._clear_content()
+            f = self._content
+
+            ctk.CTkFrame(f, fg_color=BG, height=60).pack()
+
+            make_label(f, "zako 签到助手", size=26, bold=True, anchor="center").pack()
+            make_label(f, "点击猫爪，开始喵~", size=13, color=TEXT_SEC, anchor="center").pack(pady=(4, 0))
+
+            ctk.CTkFrame(f, fg_color=BG, height=44).pack()
+
+            # 猫爪按钮主体
+            paw_frame = ctk.CTkFrame(
+                f, fg_color=SURFACE, width=180, height=180, corner_radius=90
+            )
+            paw_frame.pack()
+            paw_frame.pack_propagate(False)
+
+            paw_lbl = ctk.CTkLabel(
+                paw_frame, text="🐾", font=("Segoe UI Emoji", 80), fg_color="transparent"
+            )
+            paw_lbl.place(relx=0.5, rely=0.5, anchor="center")
+
+            # 点击 / 悬停效果
+            def on_enter(e):
+                if not self._busy:
+                    paw_frame.configure(fg_color="#2A1F35")
+
+            def on_leave(e):
+                paw_frame.configure(fg_color=SURFACE)
+
+            def on_click(e):
+                if not self._busy:
+                    self._start_login()
+
+            for w in (paw_frame, paw_lbl):
+                w.bind("<Enter>", on_enter)
+                w.bind("<Leave>", on_leave)
+                w.bind("<Button-1>", on_click)
+
+            ctk.CTkFrame(f, fg_color=BG, height=24).pack()
+
+            # 状态文字（动态更新）
+            self._home_status = make_label(
+                f, "", size=12, color=TEXT_SEC, anchor="center"
+            )
+            self._home_status.pack()
+
+            ctk.CTkFrame(f, fg_color=BG, height=20).pack()
+
+            make_label(
+                f, "厦大 CAS 畅课签到码查询工具 ❤",
+                size=11, color=TEXT_SEC, anchor="center"
+            ).pack(side="bottom", pady=16)
+
+        def _set_home_status(self, msg, color=TEXT_SEC):
+            self.after(0, lambda: self._home_status.configure(text=msg, text_color=color))
+
+        # ── 第1步：启动登录流程 ──────────────────────────────
+        def _start_login(self):
+            self._busy = True
+            self._set_home_status("正在启动浏览器，请稍候喵~❤")
+
+            def on_done(result, err):
+                if err or result is None:
+                    self._log(f"❌ 登录异常: {err}")
+                    self._busy = False
+                    self._set_home_status("❌ 出错了，再试一次喵~", DANGER)
+                    return
+
+                cookie, student_id = result
+                if not cookie or not student_id:
+                    self._log("❌ 未能获取凭证或学生ID")
+                    self._busy = False
+                    self._set_home_status("❌ 未能获取凭证，再试一次喵~", DANGER)
+                    return
+
+                self._cookie = cookie
+                self._student_id = student_id
+                self._set_home_status("✅ 凭证就绪！正在拉取课程喵~", SUCCESS)
+                self._log("✅ 凭证获取成功，开始拉取课程列表...")
+
+                def fetch_courses():
+                    s_id, y_id = get_current_semester_info(cookie, self._log)
+                    return get_courses(cookie, s_id, y_id, self._log)
+
+                def on_courses(courses, err2):
+                    self._busy = False
+                    if err2 or not courses:
+                        self._log(f"❌ 课程拉取失败: {err2}")
+                        self._set_home_status("❌ 课程列表拉取失败喵哦~", DANGER)
+                        return
+                    self._courses = courses
+                    self._log(f"🎉 成功拉取到 {len(courses)} 门课程喵！即将载入课程列表喵~❤")
+                    self._set_home_status(f"🎉 成功获取 {len(courses)} 门课程喵~❤", SUCCESS)
+                    self.after(500, self._show_courses)
+
+                run_sync_in_thread(fetch_courses, on_courses)
+
+            # 关键：Selenium 是同步函数，用 run_sync_in_thread，不要用 run_async
+            def work():
+                return login_and_get_cookie(log=self._log)
+
+            run_sync_in_thread(work, on_done)
+
+        # =======================================================
+        # 第 2 页：课程列表
+        # =======================================================
+        def _auto_scan(self):
+                """一键扫描所有课程，检测签到并自动执行"""
+                if self._busy:
+                    return
+                if not self._courses:
+                    self._log("⚠️ 找不到课程呢...主人是不是忘记登录了>.<")
+                    return
+
+                self._busy = True
+                self._log("🚀 开始一键扫描所有课程...上班了呜呜呜...")
+
+                # 顶部提示区
+                self._clear_content()
+                f = self._content
+
+                hdr = ctk.CTkFrame(f, fg_color=BG)
+                hdr.pack(fill="x", padx=20, pady=(16, 8))
+                make_label(hdr, "🚀 自动扫描中", size=24, bold=True).pack(anchor="w")
+                make_label(hdr, "zako正在依次检查每门课程的签到状态，主人请耐心等待喵~>w<...",
+                           size=12, color=TEXT_SEC).pack(anchor="w", pady=(2, 0))
+                separator(f).pack(fill="x", padx=20, pady=6)
+
+                # 进度条
+                bar_frame = ctk.CTkFrame(f, fg_color=BG)
+                bar_frame.pack(fill="x", padx=20, pady=6)
+                self._scan_bar = ctk.CTkProgressBar(
+                    bar_frame, width=460, mode="indeterminate",
+                    progress_color=ACCENT, fg_color=SURFACE2
+                )
+                self._scan_bar.pack()
+                self._scan_bar.start()
+
+                # 结果滚动区
+                self._scan_log_box = ctk.CTkTextbox(
+                    f, width=460, height=380,
+                    fg_color="#0A0912", text_color=TEXT_SEC,
+                    font=("Courier New", 11), wrap="word", state="disabled",
+                    corner_radius=10,
+                )
+                self._scan_log_box.pack(padx=20, pady=6, fill="both", expand=True)
+
+                # 后台线程执行扫描（同步函数，用 run_sync_in_thread）
+                def work():
+                    return auto_scan_all_courses(
+                        self._cookie, self._student_id, self._courses,
+                        log=self._scan_log
+                    )
+
+                def on_done(result, err):
+                    self._busy = False
+                    self.after(0, self._finish_auto_scan, result, err)
+
+                run_sync_in_thread(work, on_done)
+
+
+
+        def _scan_log(self, msg):
+            """扫描日志：同时写入全局日志和扫描窗口"""
+            self._log(msg)
+            self.after(0, self._append_scan_log, msg)
+
+        def _append_scan_log(self, msg):
+            box = getattr(self, "_scan_log_box", None)
+            if box is None:
                 return
-        except Exception:
-            return
-        box.configure(state="normal")
-        box.insert("end", msg + "\n")
-        box.see("end")
-        box.configure(state="disabled")
+            try:
+                if not box.winfo_exists():
+                    return
+            except Exception:
+                return
+            box.configure(state="normal")
+            box.insert("end", msg + "\n")
+            box.see("end")
+            box.configure(state="disabled")
 
-    def _finish_auto_scan(self, results, err):
-        # 停止进度条
-        bar = getattr(self, "_scan_bar", None)
-        if bar is not None:
+        def _finish_auto_scan(self, results, err):
+            # 停止进度条
+            bar = getattr(self, "_scan_bar", None)
+            if bar is not None:
+                try:
+                    bar.stop()
+                except Exception:
+                    pass
+
+            if err:
+                self._log(f"❌ zako扫描的时候被石头绊倒了呜呜呜: {err}")
+                self._scan_log(f"❌ 出错了喵qwq: {err}")
+                return
+
+            # 统计
+            total = len(results)
+            success = sum(1 for r in results if r.get("ok"))
+            self._scan_log(f"\n{'=' * 40}")
+            self._scan_log(f"✅ 工作完成啦！共 {total} 门课程，成功签到 {success} 次")
+
+            # 显示“返回”按钮
+            back = ctk.CTkButton(
+                self._content, text="← 返回课程列表", width=200, height=40,
+                fg_color=ACCENT, hover_color=ACCENT_DK, text_color=BG,
+                font=("Microsoft YaHei", 13, "bold"), corner_radius=10,
+                command=self._show_courses,
+            )
+            back.pack(pady=10)
+
+        def _make_course_row(self, parent, course):
+            name = course.get("display_name") or course.get("name") or "未知课程"
+            cid = course.get("id")
+
+            row = ctk.CTkFrame(parent, fg_color=SURFACE, corner_radius=12)
+            row.pack(fill="x", pady=5, padx=4)
+
+            icon = ctk.CTkLabel(
+                row, text="📚", font=("Segoe UI Emoji", 22),
+                width=44, height=44, fg_color=SURFACE2, corner_radius=10
+            )
+            icon.pack(side="left", padx=(10, 8), pady=10)
+
+            info = ctk.CTkFrame(row, fg_color="transparent")
+            info.pack(side="left", fill="x", expand=True, pady=10)
+
+            ctk.CTkLabel(
+                info, text=name,
+                font=("Microsoft YaHei", 13, "bold"),
+                text_color=TEXT_PRI, anchor="w"
+            ).pack(anchor="w")
+
+            ctk.CTkLabel(
+                info, text=f"ID: {cid}",
+                font=("Courier New", 11),
+                text_color=TEXT_SEC, anchor="w"
+            ).pack(anchor="w")
+
+            arrow = ctk.CTkLabel(row, text="›", font=("Arial", 22), text_color=TEXT_SEC)
+            arrow.pack(side="right", padx=12)
+
+            # 点击进入签到查询
+            def on_click(e, _cid=cid, _name=name):
+                self._show_code(_cid, _name)
+
+            def on_enter(e):
+                row.configure(fg_color=SURFACE2)
+
+            def on_leave(e):
+                row.configure(fg_color=SURFACE)
+
+            for w in (row, icon, info, arrow):
+                w.bind("<Button-1>", on_click)
+                w.bind("<Enter>", on_enter)
+                w.bind("<Leave>", on_leave)
+
+        def _show_courses(self):
+            self._log("DEBUG: _show_courses 被调用了")
+            self._clear_content()
+            f = self._content
+
+            hdr = ctk.CTkFrame(f, fg_color=BG)
+            hdr.pack(fill="x", padx=20, pady=(16, 8))
+
+            # 返回按钮
+            back_btn = ctk.CTkButton(
+                hdr, text="← 返回主页", width=80, height=28,
+                fg_color=SURFACE2, hover_color=SURFACE, text_color=TEXT_SEC,
+                font=("Microsoft YaHei", 12), corner_radius=8,
+                command=self._show_home,
+            )
+            back_btn.pack(anchor="w", pady=(0, 10))
+
+            # ↓↓↓ 新增：一键自动扫描按钮 ↓↓↓
+            scan_btn = ctk.CTkButton(
+                hdr, text="🚀 一键扫描并自动签到", width=200, height=36,
+                fg_color=ACCENT, hover_color=ACCENT_DK, text_color=BG,
+                font=("Microsoft YaHei", 13, "bold"), corner_radius=10,
+                command=self._auto_scan,
+            )
+            scan_btn.pack(anchor="w", pady=(0, 10))
+            # ↑↑↑ 新增结束 ↑↑↑
+
+            make_label(hdr, "选择课程", size=24, bold=True).pack(anchor="w")
+            # 标题区
+            hdr = ctk.CTkFrame(f, fg_color=BG)
+            hdr.pack(fill="x", padx=20, pady=(16, 8))
+
+            # ↓↓↓ 绝对原位插入：仅在此处新增一个返回按钮，其他排版代码1个字都不变 ↓↓↓
+            back_btn = ctk.CTkButton(
+                hdr, text="← 返回主页", width=80, height=28,
+                fg_color=SURFACE2, hover_color=SURFACE, text_color=TEXT_SEC,
+                font=("Microsoft YaHei", 12), corner_radius=8,
+                command=self._show_home,
+            )
+            back_btn.pack(anchor="w", pady=(0, 10))
+            # ↑↑↑ 插入结束 ↑↑↑
+
+            make_label(hdr, "选择课程", size=24, bold=True).pack(anchor="w")
+            make_label(
+                hdr, f"共 {len(self._courses)} 门课，点击查看最新签到码",
+                size=12, color=TEXT_SEC
+            ).pack(anchor="w", pady=(2, 0))
+
+            separator(f).pack(fill="x", padx=20, pady=4)
+
+            # 可滚动课程列表
+            scroll = ctk.CTkScrollableFrame(f, fg_color=BG, scrollbar_button_color=SURFACE2)
+            scroll.pack(fill="both", expand=True, padx=12, pady=4)
+
+            for course in self._courses:
+                self._make_course_row(scroll, course)
+
+        # =======================================================
+        # 第 3 页：签到结果（数字 / 雷达统一判定）
+        # =======================================================
+        def _show_code(self, course_id, course_name):
+            self._clear_content()
+            f = self._content
+
+            # 顶部：返回按钮 + 课程名
+            hdr = ctk.CTkFrame(f, fg_color=BG)
+            hdr.pack(fill="x", padx=12, pady=(14, 4))
+
+            back_btn = ctk.CTkButton(
+                hdr, text="← 返回", width=72, height=32,
+                fg_color=SURFACE2, hover_color=SURFACE, text_color=TEXT_SEC,
+                font=("Microsoft YaHei", 12), corner_radius=8,
+                command=self._show_courses,
+            )
+            back_btn.pack(side="left")
+
+            make_label(
+                hdr, text=course_name, size=14, bold=True,
+                color=TEXT_PRI, anchor="w", wraplength=330
+            ).pack(side="left", padx=10)
+
+            separator(f).pack(fill="x", padx=20, pady=6)
+
+            # 结果卡片容器（先放 loading）
+            self._code_card_frame = ctk.CTkFrame(f, fg_color=BG)
+            self._code_card_frame.pack(fill="both", expand=True, padx=20, pady=10)
+
+            self._show_loading_card()
+
+            # 后台拉取最新签到记录，并统一判定类型
+            def fetch():
+                latest = get_latest_rollcall(course_id, self._cookie, self._student_id)
+                if latest is None:
+                    return None
+                rid = str(latest.get("id") or latest.get("rollcall_id") or "")
+                t = fmt_time(latest.get("rollcall_time") or latest.get("created_at"))
+
+                # 先判断是否为雷达签到
+                is_radar = (
+                        bool(latest.get("is_radar"))
+                        or bool(latest.get("isRadar"))
+                        or "radar" in str(latest.get("type", "")).lower()
+                )
+                if is_radar:
+                    active = find_active_radar_record(self._cookie, rid, self._log)
+                    if active is not None or str(latest.get("status") or "") == "active":
+                        return {"type": "radar_active", "rid": rid, "time": t}
+                    return {"type": "radar_past", "time": t}
+
+                # 如果是数字签到（包括已结束的）
+                if latest.get("is_number"):
+                    # 尝试获取 number_code（可能为 None）
+                    number_code, status, _ = get_number_code(rid, self._cookie)
+                    # 如果 status 为空，从 latest 中获取
+                    if not status:
+                        status = latest.get("status", "finished")
+                    return {
+                        "type": "digital",
+                        "code": number_code,  # 可能为 None
+                        "status": status,
+                        "time": t,
+                        "rid": rid,
+                    }
+
+                # 其他情况（如 GPS、扫码等）
+                return {"type": "other", "time": t}
+
+            def on_result(result, err):
+                if err:
+                    self._log(f"❌ 查询出错: {err}")
+                    self.after(0, self._show_result_card, None, course_id, course_name)
+                    return
+                self._log(
+                    f"✅ {course_name} | {result['time'] if result else '-'} "
+                    f"| 类型: {result['type'] if result else '无'}"
+                )
+                self.after(0, self._show_result_card, result, course_id, course_name)
+
+            run_sync_in_thread(fetch, on_result)
+
+        def _clear_card_frame(self):
+            def _stop_bars(parent):
+                for child in parent.winfo_children():
+                    if isinstance(child, ctk.CTkProgressBar):
+                        try:
+                            child.stop()
+                        except Exception:
+                            pass
+                    _stop_bars(child)
+
+            _stop_bars(self._code_card_frame)
+            for w in self._code_card_frame.winfo_children():
+                w.destroy()
+
+        def _show_loading_card(self):
+            self._clear_card_frame()
+            card = ctk.CTkFrame(self._code_card_frame, fg_color=SURFACE, corner_radius=20)
+            card.pack(fill="both", expand=True)
+            ctk.CTkLabel(
+                card, text="🔍", font=("Segoe UI Emoji", 48)
+            ).place(relx=0.5, rely=0.4, anchor="center")
+            ctk.CTkLabel(
+                card, text="正在查询签到喵~",
+                font=("Microsoft YaHei", 14), text_color=TEXT_SEC
+            ).place(relx=0.5, rely=0.56, anchor="center")
+            ctk.CTkProgressBar(
+                card, width=200, mode="indeterminate",
+                progress_color=ACCENT, fg_color=SURFACE2
+            ).place(relx=0.5, rely=0.68, anchor="center")
+            # 启动动画
+            for w in card.winfo_children():
+                if isinstance(w, ctk.CTkProgressBar):
+                    w.start()
+
+        def _show_result_card(self, result, course_id, course_name):
+            self._clear_card_frame()
+
+            card = ctk.CTkFrame(self._code_card_frame, fg_color=SURFACE, corner_radius=20)
+            card.pack(fill="both", expand=True)
+
+            inner = ctk.CTkFrame(card, fg_color="transparent")
+            inner.place(relx=0.5, rely=0.5, anchor="center")
+
+            if result is None:
+                # 无签到记录
+                ctk.CTkLabel(inner, text="😿", font=("Segoe UI Emoji", 52)).pack()
+                make_label(inner, "暂无签到记录", size=18, bold=True, anchor="center").pack(pady=(8, 2))
+                make_label(inner, "这门课还没有签到喵~", size=13, color=TEXT_SEC, anchor="center").pack()
+
+            elif result["type"] == "digital":
+                # 有数字签到码
+                status_map = {"active": ("✅ 进行中", SUCCESS), "finished": ("🔒 已结束", TEXT_SEC)}
+                status_txt, status_clr = status_map.get(result["status"], (result["status"], TEXT_SEC))
+
+                ctk.CTkLabel(inner, text="🐾", font=("Segoe UI Emoji", 46)).pack()
+                make_label(inner, "签到码", size=13, color=TEXT_SEC, anchor="center").pack(pady=(4, 0))
+
+                # 大号签到码（可选中复制）
+                code_entry = ctk.CTkEntry(
+                    inner, width=240, height=80,
+                    font=("Arial Black", 48),
+                    text_color=ACCENT, fg_color="transparent",
+                    border_width=0, justify="center",
+                )
+                code_entry.insert(0, str(result["code"]))
+                code_entry.configure(state="readonly")
+                code_entry.pack(pady=4)
+
+                # 状态标签
+                status_frame = ctk.CTkFrame(inner, fg_color=SURFACE2, corner_radius=20)
+                status_frame.pack(pady=4)
+                ctk.CTkLabel(
+                    status_frame, text=status_txt,
+                    font=("Microsoft YaHei", 12, "bold"),
+                    text_color=status_clr
+                ).pack(padx=16, pady=5)
+
+                make_label(
+                    inner, f"签到时间：{result['time']}",
+                    size=12, color=TEXT_SEC, anchor="center"
+                ).pack(pady=(6, 0))
+
+                if result["status"] == "active":
+                    make_button(
+                        inner, "🐾 一键数字签到",
+                        command=lambda: self._start_number(
+                            result["rid"], course_id, course_name
+                        ),
+                        width=240, height=46, size=14
+                    ).pack(pady=(14, 0))
+                else:
+                    make_label(
+                        inner, "签到已结束，无需提交喵~",
+                        size=12, color=TEXT_SEC, anchor="center"
+                    ).pack(pady=(10, 0))
+
+            elif result["type"] == "radar_active":
+                # 雷达签到正在进行
+                ctk.CTkLabel(inner, text="📡", font=("Segoe UI Emoji", 52)).pack()
+                make_label(inner, "雷达签到进行中喵❤", size=18, bold=True, anchor="center").pack(pady=(8, 2))
+                make_label(
+                    inner, "教师在实时广播位置，点击按钮自动定位签到喵~",
+                    size=12, color=TEXT_SEC, anchor="center"
+                ).pack()
+                make_label(
+                    inner, f"签到时间：{result['time']}",
+                    size=12, color=TEXT_SEC, anchor="center"
+                ).pack(pady=(6, 0))
+                make_button(
+                    inner, "🛰 一键雷达签到",
+                    command=lambda: self._start_radar(result["rid"], course_name),
+                    width=240, height=46, size=14
+                ).pack(pady=(14, 0))
+
+            elif result["type"] == "radar_past":
+                # 只有历史雷达签到记录
+                ctk.CTkLabel(inner, text="📡", font=("Segoe UI Emoji", 52)).pack()
+                make_label(inner, "上一次是雷达签到喵❤", size=18, bold=True, anchor="center").pack(pady=(8, 2))
+                make_label(
+                    inner, "当前没有进行中的雷达签到喵~",
+                    size=12, color=TEXT_SEC, anchor="center"
+                ).pack()
+                make_label(
+                    inner, f"签到时间：{result['time']}",
+                    size=12, color=TEXT_SEC, anchor="center"
+                ).pack(pady=(6, 0))
+
+            else:
+                # 无数字签到码（GPS/扫码等）
+                ctk.CTkLabel(inner, text="📍", font=("Segoe UI Emoji", 52)).pack()
+                make_label(inner, "无数字签到码", size=18, bold=True, anchor="center").pack(pady=(8, 2))
+                make_label(
+                    inner, "可能是 GPS / 扫码等其他签到方式喵~",
+                    size=12, color=TEXT_SEC, anchor="center"
+                ).pack()
+                make_label(
+                    inner, f"签到时间：{result['time']}",
+                    size=12, color=TEXT_SEC, anchor="center"
+                ).pack(pady=(6, 0))
+
+            # 再查一次按钮
+            make_button(
+                self._code_card_frame, "🔄 再查一次",
+                command=lambda: self._show_code(course_id, course_name),
+                width=300, height=42
+            ).pack(pady=(12, 4))
+
+        # =======================================================
+        # 第 4 页：雷达签到执行视图
+        # =======================================================
+        def _start_radar(self, rollcall_id, course_name):
+            if self._radar_running:
+                return
+            self._radar_running = True
+            self._log(f"🛰 主人点击了雷达签到喵❤ rollcall_id={rollcall_id}")
+
+            self._clear_card_frame()
+
+            card = ctk.CTkFrame(self._code_card_frame, fg_color=SURFACE, corner_radius=20)
+            card.pack(fill="both", expand=True)
+
+            inner = ctk.CTkFrame(card, fg_color="transparent")
+            inner.place(relx=0.5, rely=0.5, anchor="center")
+
+            ctk.CTkLabel(inner, text="🛰", font=("Segoe UI Emoji", 46)).pack()
+            self._radar_status = make_label(
+                inner, "正在四校区定位教师位置喵~请稍候...",
+                size=13, color=TEXT_SEC, anchor="center"
+            )
+            self._radar_status.pack(pady=(6, 8))
+
+            self._radar_bar = ctk.CTkProgressBar(
+                inner, width=220, mode="indeterminate",
+                progress_color=ACCENT, fg_color=SURFACE2
+            )
+            self._radar_bar.pack(pady=(0, 10))
+            self._radar_bar.start()
+
+            self._radar_log_box = ctk.CTkTextbox(
+                inner, width=380, height=150,
+                fg_color="#0A0912", text_color=TEXT_SEC,
+                font=("Courier New", 11), wrap="word", state="disabled",
+                corner_radius=8,
+            )
+            self._radar_log_box.pack()
+
+            def work():
+                return send_radar(self._cookie, rollcall_id, log=self._radar_log)
+
+            def on_done(result, err):
+                if err:
+                    self.after(0, self._finish_radar, False, {"error": str(err)}, rollcall_id, course_name)
+                    return
+                ok, info = result
+                self.after(0, self._finish_radar, ok, info, rollcall_id, course_name)
+
+            run_sync_in_thread(work, on_done)
+
+        def _radar_log(self, msg):
+            self._log(msg)
+            self.after(0, self._append_radar_log, msg)
+
+        def _append_radar_log(self, msg):
+            box = getattr(self, "_radar_log_box", None)
+            if box is None:
+                return
+            try:
+                if not box.winfo_exists():
+                    return
+            except Exception:
+                return
+            box.configure(state="normal")
+            box.insert("end", msg + "\n")
+            box.see("end")
+            box.configure(state="disabled")
+
+        def _finish_radar(self, ok, info, rollcall_id, course_name):
+            self._radar_running = False
+
+            status = getattr(self, "_radar_status", None)
+            bar = getattr(self, "_radar_bar", None)
+            if status is None or bar is None:
+                return
+            try:
+                if not status.winfo_exists():
+                    return
+            except Exception:
+                return
             try:
                 bar.stop()
             except Exception:
                 pass
 
-        if err:
-            self._log(f"❌ 自动扫描出错: {err}")
-            self._scan_log(f"❌ 出错: {err}")
-            return
+            if ok:
+                campus = info.get("campus") or ""
+                detail = f"（{campus}）" if campus else ""
+                pos = info.get("position")
+                if pos:
+                    detail += f" 位置≈({pos[0]:.5f}, {pos[1]:.5f})"
+                status.configure(text=f"✅ 雷达签到成功喵❤ {detail}", text_color=SUCCESS)
+            else:
+                status.configure(text="❌ 雷达签到失败喵，请重试~", text_color=DANGER)
+                make_button(
+                    self._code_card_frame, "🔄 再试一次",
+                    command=lambda: self._start_radar(rollcall_id, course_name),
+                    width=300, height=42
+                ).pack(pady=(12, 4))
 
-        # 统计
-        total = len(results)
-        success = sum(1 for r in results if r.get("ok"))
-        self._scan_log(f"\n{'=' * 40}")
-        self._scan_log(f"✅ 扫描完成！共 {total} 门课程，成功签到 {success} 次")
-
-        # 显示“返回”按钮
-        back = ctk.CTkButton(
-            self._content, text="← 返回课程列表", width=200, height=40,
-            fg_color=ACCENT, hover_color=ACCENT_DK, text_color=BG,
-            font=("Microsoft YaHei", 13, "bold"), corner_radius=10,
-            command=self._show_courses,
-        )
-        back.pack(pady=10)
-
-    def _make_course_row(self, parent, course):
-        name = course.get("display_name") or course.get("name") or "未知课程"
-        cid = course.get("id")
-
-        row = ctk.CTkFrame(parent, fg_color=SURFACE, corner_radius=12)
-        row.pack(fill="x", pady=5, padx=4)
-
-        icon = ctk.CTkLabel(
-            row, text="📚", font=("Segoe UI Emoji", 22),
-            width=44, height=44, fg_color=SURFACE2, corner_radius=10
-        )
-        icon.pack(side="left", padx=(10, 8), pady=10)
-
-        info = ctk.CTkFrame(row, fg_color="transparent")
-        info.pack(side="left", fill="x", expand=True, pady=10)
-
-        ctk.CTkLabel(
-            info, text=name,
-            font=("Microsoft YaHei", 13, "bold"),
-            text_color=TEXT_PRI, anchor="w"
-        ).pack(anchor="w")
-
-        ctk.CTkLabel(
-            info, text=f"ID: {cid}",
-            font=("Courier New", 11),
-            text_color=TEXT_SEC, anchor="w"
-        ).pack(anchor="w")
-
-        arrow = ctk.CTkLabel(row, text="›", font=("Arial", 22), text_color=TEXT_SEC)
-        arrow.pack(side="right", padx=12)
-
-        # 点击进入签到查询
-        def on_click(e, _cid=cid, _name=name):
-            self._show_code(_cid, _name)
-
-        def on_enter(e):
-            row.configure(fg_color=SURFACE2)
-
-        def on_leave(e):
-            row.configure(fg_color=SURFACE)
-
-        for w in (row, icon, info, arrow):
-            w.bind("<Button-1>", on_click)
-            w.bind("<Enter>", on_enter)
-            w.bind("<Leave>", on_leave)
-
-    def _show_courses(self):
-        self._log("DEBUG: _show_courses 被调用了")
-        self._clear_content()
-        f = self._content
-
-        hdr = ctk.CTkFrame(f, fg_color=BG)
-        hdr.pack(fill="x", padx=20, pady=(16, 8))
-
-        # 返回按钮
-        back_btn = ctk.CTkButton(
-            hdr, text="← 返回主页", width=80, height=28,
-            fg_color=SURFACE2, hover_color=SURFACE, text_color=TEXT_SEC,
-            font=("Microsoft YaHei", 12), corner_radius=8,
-            command=self._show_home,
-        )
-        back_btn.pack(anchor="w", pady=(0, 10))
-
-        # ↓↓↓ 新增：一键自动扫描按钮 ↓↓↓
-        scan_btn = ctk.CTkButton(
-            hdr, text="🚀 一键扫描并自动签到", width=200, height=36,
-            fg_color=ACCENT, hover_color=ACCENT_DK, text_color=BG,
-            font=("Microsoft YaHei", 13, "bold"), corner_radius=10,
-            command=self._auto_scan,
-        )
-        scan_btn.pack(anchor="w", pady=(0, 10))
-        # ↑↑↑ 新增结束 ↑↑↑
-
-        make_label(hdr, "选择课程", size=24, bold=True).pack(anchor="w")
-        # 标题区
-        hdr = ctk.CTkFrame(f, fg_color=BG)
-        hdr.pack(fill="x", padx=20, pady=(16, 8))
-
-        # ↓↓↓ 绝对原位插入：仅在此处新增一个返回按钮，其他排版代码1个字都不变 ↓↓↓
-        back_btn = ctk.CTkButton(
-            hdr, text="← 返回主页", width=80, height=28,
-            fg_color=SURFACE2, hover_color=SURFACE, text_color=TEXT_SEC,
-            font=("Microsoft YaHei", 12), corner_radius=8,
-            command=self._show_home,
-        )
-        back_btn.pack(anchor="w", pady=(0, 10))
-        # ↑↑↑ 插入结束 ↑↑↑
-
-        make_label(hdr, "选择课程", size=24, bold=True).pack(anchor="w")
-        make_label(
-            hdr, f"共 {len(self._courses)} 门课，点击查看最新签到码",
-            size=12, color=TEXT_SEC
-        ).pack(anchor="w", pady=(2, 0))
-
-        separator(f).pack(fill="x", padx=20, pady=4)
-
-        # 可滚动课程列表
-        scroll = ctk.CTkScrollableFrame(f, fg_color=BG, scrollbar_button_color=SURFACE2)
-        scroll.pack(fill="both", expand=True, padx=12, pady=4)
-
-        for course in self._courses:
-            self._make_course_row(scroll, course)
-
-    # =======================================================
-    # 第 3 页：签到结果（数字 / 雷达统一判定）
-    # =======================================================
-    def _show_code(self, course_id, course_name):
-        self._clear_content()
-        f = self._content
-
-        # 顶部：返回按钮 + 课程名
-        hdr = ctk.CTkFrame(f, fg_color=BG)
-        hdr.pack(fill="x", padx=12, pady=(14, 4))
-
-        back_btn = ctk.CTkButton(
-            hdr, text="← 返回", width=72, height=32,
-            fg_color=SURFACE2, hover_color=SURFACE, text_color=TEXT_SEC,
-            font=("Microsoft YaHei", 12), corner_radius=8,
-            command=self._show_courses,
-        )
-        back_btn.pack(side="left")
-
-        make_label(
-            hdr, text=course_name, size=14, bold=True,
-            color=TEXT_PRI, anchor="w", wraplength=330
-        ).pack(side="left", padx=10)
-
-        separator(f).pack(fill="x", padx=20, pady=6)
-
-        # 结果卡片容器（先放 loading）
-        self._code_card_frame = ctk.CTkFrame(f, fg_color=BG)
-        self._code_card_frame.pack(fill="both", expand=True, padx=20, pady=10)
-
-        self._show_loading_card()
-
-        # 后台拉取最新签到记录，并统一判定类型
-        def fetch():
-            latest = get_latest_rollcall(course_id, self._cookie, self._student_id)
-            if latest is None:
-                return None
-            rid = str(latest.get("id") or latest.get("rollcall_id") or "")
-            t = fmt_time(latest.get("rollcall_time") or latest.get("created_at"))
-
-            # 先判断是否为雷达签到
-            is_radar = (
-                    bool(latest.get("is_radar"))
-                    or bool(latest.get("isRadar"))
-                    or "radar" in str(latest.get("type", "")).lower()
-            )
-            if is_radar:
-                active = find_active_radar_record(self._cookie, rid, self._log)
-                if active is not None or str(latest.get("status") or "") == "active":
-                    return {"type": "radar_active", "rid": rid, "time": t}
-                return {"type": "radar_past", "time": t}
-
-            # 如果是数字签到（包括已结束的）
-            if latest.get("is_number"):
-                # 尝试获取 number_code（可能为 None）
-                number_code, status, _ = get_number_code(rid, self._cookie)
-                # 如果 status 为空，从 latest 中获取
-                if not status:
-                    status = latest.get("status", "finished")
-                return {
-                    "type": "digital",
-                    "code": number_code,  # 可能为 None
-                    "status": status,
-                    "time": t,
-                    "rid": rid,
-                }
-
-            # 其他情况（如 GPS、扫码等）
-            return {"type": "other", "time": t}
-
-        def on_result(result, err):
-            if err:
-                self._log(f"❌ 查询出错: {err}")
-                self.after(0, self._show_result_card, None, course_id, course_name)
+        def _start_number(self, rollcall_id, course_id, course_name):
+            if self._number_running:
                 return
-            self._log(
-                f"✅ {course_name} | {result['time'] if result else '-'} "
-                f"| 类型: {result['type'] if result else '无'}"
-            )
-            self.after(0, self._show_result_card, result, course_id, course_name)
+            self._number_running = True
+            self._log(f"🐾 主人点击了数字签到喵❤ rollcall_id={rollcall_id}")
 
-        run_sync_in_thread(fetch, on_result)
+            self._clear_card_frame()
 
-    def _clear_card_frame(self):
-        def _stop_bars(parent):
-            for child in parent.winfo_children():
-                if isinstance(child, ctk.CTkProgressBar):
-                    try:
-                        child.stop()
-                    except Exception:
-                        pass
-                _stop_bars(child)
-        _stop_bars(self._code_card_frame)
-        for w in self._code_card_frame.winfo_children():
-            w.destroy()
+            card = ctk.CTkFrame(self._code_card_frame, fg_color=SURFACE, corner_radius=20)
+            card.pack(fill="both", expand=True)
 
-    def _show_loading_card(self):
-        self._clear_card_frame()
-        card = ctk.CTkFrame(self._code_card_frame, fg_color=SURFACE, corner_radius=20)
-        card.pack(fill="both", expand=True)
-        ctk.CTkLabel(
-            card, text="🔍", font=("Segoe UI Emoji", 48)
-        ).place(relx=0.5, rely=0.4, anchor="center")
-        ctk.CTkLabel(
-            card, text="正在查询签到喵~",
-            font=("Microsoft YaHei", 14), text_color=TEXT_SEC
-        ).place(relx=0.5, rely=0.56, anchor="center")
-        ctk.CTkProgressBar(
-            card, width=200, mode="indeterminate",
-            progress_color=ACCENT, fg_color=SURFACE2
-        ).place(relx=0.5, rely=0.68, anchor="center")
-        # 启动动画
-        for w in card.winfo_children():
-            if isinstance(w, ctk.CTkProgressBar):
-                w.start()
-
-    def _show_result_card(self, result, course_id, course_name):
-        self._clear_card_frame()
-
-        card = ctk.CTkFrame(self._code_card_frame, fg_color=SURFACE, corner_radius=20)
-        card.pack(fill="both", expand=True)
-
-        inner = ctk.CTkFrame(card, fg_color="transparent")
-        inner.place(relx=0.5, rely=0.5, anchor="center")
-
-        if result is None:
-            # 无签到记录
-            ctk.CTkLabel(inner, text="😿", font=("Segoe UI Emoji", 52)).pack()
-            make_label(inner, "暂无签到记录", size=18, bold=True, anchor="center").pack(pady=(8,2))
-            make_label(inner, "这门课还没有签到喵~", size=13, color=TEXT_SEC, anchor="center").pack()
-
-        elif result["type"] == "digital":
-            # 有数字签到码
-            status_map   = {"active": ("✅ 进行中", SUCCESS), "finished": ("🔒 已结束", TEXT_SEC)}
-            status_txt, status_clr = status_map.get(result["status"], (result["status"], TEXT_SEC))
+            inner = ctk.CTkFrame(card, fg_color="transparent")
+            inner.place(relx=0.5, rely=0.5, anchor="center")
 
             ctk.CTkLabel(inner, text="🐾", font=("Segoe UI Emoji", 46)).pack()
-            make_label(inner, "签到码", size=13, color=TEXT_SEC, anchor="center").pack(pady=(4,0))
-
-            # 大号签到码（可选中复制）
-            code_entry = ctk.CTkEntry(
-                inner, width=240, height=80,
-                font=("Arial Black", 48),
-                text_color=ACCENT, fg_color="transparent",
-                border_width=0, justify="center",
+            self._number_status = make_label(
+                inner, "正在提交数字签到喵~请稍候...",
+                size=13, color=TEXT_SEC, anchor="center"
             )
-            code_entry.insert(0, str(result["code"]))
-            code_entry.configure(state="readonly")
-            code_entry.pack(pady=4)
+            self._number_status.pack(pady=(6, 8))
 
-            # 状态标签
-            status_frame = ctk.CTkFrame(inner, fg_color=SURFACE2, corner_radius=20)
-            status_frame.pack(pady=4)
-            ctk.CTkLabel(
-                status_frame, text=status_txt,
-                font=("Microsoft YaHei", 12, "bold"),
-                text_color=status_clr
-            ).pack(padx=16, pady=5)
+            self._number_bar = ctk.CTkProgressBar(
+                inner, width=220, mode="indeterminate",
+                progress_color=ACCENT, fg_color=SURFACE2
+            )
+            self._number_bar.pack(pady=(0, 10))
+            self._number_bar.start()
 
-            make_label(
-                inner, f"签到时间：{result['time']}",
-                size=12, color=TEXT_SEC, anchor="center"
-            ).pack(pady=(6, 0))
+            def work():
+                return submit_number_code(self._cookie, rollcall_id, log=self._log)
 
-            if result["status"] == "active":
+            def on_done(result, err):
+                if err:
+                    self.after(0, self._finish_number, False, {"reason": "exception", "error": str(err)}, rollcall_id,
+                               course_id, course_name)
+                    return
+                ok, info = result
+                self.after(0, self._finish_number, ok, info, rollcall_id, course_id, course_name)
+
+            run_sync_in_thread(work, on_done)
+
+        def _finish_number(self, ok, info, rollcall_id, course_id, course_name):
+            self._number_running = False
+
+            status = getattr(self, "_number_status", None)
+            bar = getattr(self, "_number_bar", None)
+            if status is None or bar is None:
+                return
+            try:
+                if not status.winfo_exists():
+                    return
+            except Exception:
+                return
+            try:
+                bar.stop()
+            except Exception:
+                pass
+
+            if ok:
+                code = info.get("code") or ""
+                status.configure(text=f"✅ 数字签到成功喵❤ 签到码：{code}", text_color=SUCCESS)
+            else:
+                reason = info.get("reason")
+                if reason == "finished":
+                    status.configure(text="⏰ 签到已结束，无法提交喵~", text_color=DANGER)
+                elif reason == "no_code":
+                    status.configure(text="❌ 未获取到签到码喵，请再查一次~", text_color=DANGER)
+                else:
+                    status.configure(text="❌ 数字签到失败喵，请重试~", text_color=DANGER)
                 make_button(
-                    inner, "🐾 一键数字签到",
-                    command=lambda: self._start_number(
-                        result["rid"], course_id, course_name
-                    ),
-                    width=240, height=46, size=14
-                ).pack(pady=(14, 0))
-            else:
-                make_label(
-                    inner, "签到已结束，无需提交喵~",
-                    size=12, color=TEXT_SEC, anchor="center"
-                ).pack(pady=(10, 0))
-
-        elif result["type"] == "radar_active":
-            # 雷达签到正在进行
-            ctk.CTkLabel(inner, text="📡", font=("Segoe UI Emoji", 52)).pack()
-            make_label(inner, "雷达签到进行中喵❤", size=18, bold=True, anchor="center").pack(pady=(8,2))
-            make_label(
-                inner, "教师在实时广播位置，点击按钮自动定位签到喵~",
-                size=12, color=TEXT_SEC, anchor="center"
-            ).pack()
-            make_label(
-                inner, f"签到时间：{result['time']}",
-                size=12, color=TEXT_SEC, anchor="center"
-            ).pack(pady=(6, 0))
+                    self._code_card_frame, "🔄 再试一次",
+                    command=lambda: self._start_number(rollcall_id, course_id, course_name),
+                    width=300, height=42
+                ).pack(pady=(12, 4))
             make_button(
-                inner, "🛰 一键雷达签到",
-                command=lambda: self._start_radar(result["rid"], course_name),
-                width=240, height=46, size=14
-            ).pack(pady=(14, 0))
-
-        elif result["type"] == "radar_past":
-            # 只有历史雷达签到记录
-            ctk.CTkLabel(inner, text="📡", font=("Segoe UI Emoji", 52)).pack()
-            make_label(inner, "上一次是雷达签到喵❤", size=18, bold=True, anchor="center").pack(pady=(8,2))
-            make_label(
-                inner, "当前没有进行中的雷达签到喵~",
-                size=12, color=TEXT_SEC, anchor="center"
-            ).pack()
-            make_label(
-                inner, f"签到时间：{result['time']}",
-                size=12, color=TEXT_SEC, anchor="center"
-            ).pack(pady=(6, 0))
-
-        else:
-            # 无数字签到码（GPS/扫码等）
-            ctk.CTkLabel(inner, text="📍", font=("Segoe UI Emoji", 52)).pack()
-            make_label(inner, "无数字签到码", size=18, bold=True, anchor="center").pack(pady=(8,2))
-            make_label(
-                inner, "可能是 GPS / 扫码等其他签到方式喵~",
-                size=12, color=TEXT_SEC, anchor="center"
-            ).pack()
-            make_label(
-                inner, f"签到时间：{result['time']}",
-                size=12, color=TEXT_SEC, anchor="center"
-            ).pack(pady=(6, 0))
-
-        # 再查一次按钮
-        make_button(
-            self._code_card_frame, "🔄 再查一次",
-            command=lambda: self._show_code(course_id, course_name),
-            width=300, height=42
-        ).pack(pady=(12, 4))
-
-    # =======================================================
-    # 第 4 页：雷达签到执行视图
-    # =======================================================
-    def _start_radar(self, rollcall_id, course_name):
-        if self._radar_running:
-            return
-        self._radar_running = True
-        self._log(f"🛰 主人点击了雷达签到喵❤ rollcall_id={rollcall_id}")
-
-        self._clear_card_frame()
-
-        card = ctk.CTkFrame(self._code_card_frame, fg_color=SURFACE, corner_radius=20)
-        card.pack(fill="both", expand=True)
-
-        inner = ctk.CTkFrame(card, fg_color="transparent")
-        inner.place(relx=0.5, rely=0.5, anchor="center")
-
-        ctk.CTkLabel(inner, text="🛰", font=("Segoe UI Emoji", 46)).pack()
-        self._radar_status = make_label(
-            inner, "正在四校区定位教师位置喵~请稍候...",
-            size=13, color=TEXT_SEC, anchor="center"
-        )
-        self._radar_status.pack(pady=(6, 8))
-
-        self._radar_bar = ctk.CTkProgressBar(
-            inner, width=220, mode="indeterminate",
-            progress_color=ACCENT, fg_color=SURFACE2
-        )
-        self._radar_bar.pack(pady=(0, 10))
-        self._radar_bar.start()
-
-        self._radar_log_box = ctk.CTkTextbox(
-            inner, width=380, height=150,
-            fg_color="#0A0912", text_color=TEXT_SEC,
-            font=("Courier New", 11), wrap="word", state="disabled",
-            corner_radius=8,
-        )
-        self._radar_log_box.pack()
-
-        def work():
-            return send_radar(self._cookie, rollcall_id, log=self._radar_log)
-
-        def on_done(result, err):
-            if err:
-                self.after(0, self._finish_radar, False, {"error": str(err)}, rollcall_id, course_name)
-                return
-            ok, info = result
-            self.after(0, self._finish_radar, ok, info, rollcall_id, course_name)
-
-        run_sync_in_thread(work, on_done)
-
-    def _radar_log(self, msg):
-        self._log(msg)
-        self.after(0, self._append_radar_log, msg)
-
-    def _append_radar_log(self, msg):
-        box = getattr(self, "_radar_log_box", None)
-        if box is None:
-            return
-        try:
-            if not box.winfo_exists():
-                return
-        except Exception:
-            return
-        box.configure(state="normal")
-        box.insert("end", msg + "\n")
-        box.see("end")
-        box.configure(state="disabled")
-
-    def _finish_radar(self, ok, info, rollcall_id, course_name):
-        self._radar_running = False
-
-        status = getattr(self, "_radar_status", None)
-        bar = getattr(self, "_radar_bar", None)
-        if status is None or bar is None:
-            return
-        try:
-            if not status.winfo_exists():
-                return
-        except Exception:
-            return
-        try:
-            bar.stop()
-        except Exception:
-            pass
-
-        if ok:
-            campus = info.get("campus") or ""
-            detail = f"（{campus}）" if campus else ""
-            pos = info.get("position")
-            if pos:
-                detail += f" 位置≈({pos[0]:.5f}, {pos[1]:.5f})"
-            status.configure(text=f"✅ 雷达签到成功喵❤ {detail}", text_color=SUCCESS)
-        else:
-            status.configure(text="❌ 雷达签到失败喵，请重试~", text_color=DANGER)
-            make_button(
-                self._code_card_frame, "🔄 再试一次",
-                command=lambda: self._start_radar(rollcall_id, course_name),
+                self._code_card_frame, "↩ 返回签到码",
+                command=lambda: self._show_code(course_id, course_name),
                 width=300, height=42
-            ).pack(pady=(12, 4))
+            ).pack(pady=(8, 4))
 
-    def _start_number(self, rollcall_id, course_id, course_name):
-        if self._number_running:
-            return
-        self._number_running = True
-        self._log(f"🐾 主人点击了数字签到喵❤ rollcall_id={rollcall_id}")
+else:
+    ZakoApp = None
 
-        self._clear_card_frame()
-
-        card = ctk.CTkFrame(self._code_card_frame, fg_color=SURFACE, corner_radius=20)
-        card.pack(fill="both", expand=True)
-
-        inner = ctk.CTkFrame(card, fg_color="transparent")
-        inner.place(relx=0.5, rely=0.5, anchor="center")
-
-        ctk.CTkLabel(inner, text="🐾", font=("Segoe UI Emoji", 46)).pack()
-        self._number_status = make_label(
-            inner, "正在提交数字签到喵~请稍候...",
-            size=13, color=TEXT_SEC, anchor="center"
-        )
-        self._number_status.pack(pady=(6, 8))
-
-        self._number_bar = ctk.CTkProgressBar(
-            inner, width=220, mode="indeterminate",
-            progress_color=ACCENT, fg_color=SURFACE2
-        )
-        self._number_bar.pack(pady=(0, 10))
-        self._number_bar.start()
-
-        def work():
-            return submit_number_code(self._cookie, rollcall_id, log=self._log)
-
-        def on_done(result, err):
-            if err:
-                self.after(0, self._finish_number, False, {"reason": "exception", "error": str(err)}, rollcall_id, course_id, course_name)
-                return
-            ok, info = result
-            self.after(0, self._finish_number, ok, info, rollcall_id, course_id, course_name)
-
-        run_sync_in_thread(work, on_done)
-
-    def _finish_number(self, ok, info, rollcall_id, course_id, course_name):
-        self._number_running = False
-
-        status = getattr(self, "_number_status", None)
-        bar = getattr(self, "_number_bar", None)
-        if status is None or bar is None:
-            return
-        try:
-            if not status.winfo_exists():
-                return
-        except Exception:
-            return
-        try:
-            bar.stop()
-        except Exception:
-            pass
-
-        if ok:
-            code = info.get("code") or ""
-            status.configure(text=f"✅ 数字签到成功喵❤ 签到码：{code}", text_color=SUCCESS)
-        else:
-            reason = info.get("reason")
-            if reason == "finished":
-                status.configure(text="⏰ 签到已结束，无法提交喵~", text_color=DANGER)
-            elif reason == "no_code":
-                status.configure(text="❌ 未获取到签到码喵，请再查一次~", text_color=DANGER)
-            else:
-                status.configure(text="❌ 数字签到失败喵，请重试~", text_color=DANGER)
-            make_button(
-                self._code_card_frame, "🔄 再试一次",
-                command=lambda: self._start_number(rollcall_id, course_id, course_name),
-                width=300, height=42
-            ).pack(pady=(12, 4))
-        make_button(
-            self._code_card_frame, "↩ 返回签到码",
-            command=lambda: self._show_code(course_id, course_name),
-            width=300, height=42
-        ).pack(pady=(8, 4))
 def run_cli_mode():
-    """无 GUI 环境下的命令行模式"""
+    """无 GUI 环境下的命令行模式（常驻循环）"""
     print("🖥 无 UI 环境，进入命令行模式")
     print("=" * 50)
-
-    # 1. 登录获取 Cookie
-    cookie, student_id = asyncio.run(login_and_get_cookie(log=print))
-
+    import time
+    # 1. 登录一次，获取 Cookie
+    cookie, student_id = login_and_get_cookie(log=print)
     if not cookie or not student_id:
-        print("❌ 登录失败了呜呜")
+        print("❌ 登录失败了呜呜呜")
         sys.exit(1)
+    print(f"✅ 登录成功啦，主人的学生ID在这里哦~: {student_id}")
 
-    print(f"✅ 找到主人的学生ID: {student_id}了！")
+    scan_interval = 120                   # 上课时段：每 2 分钟扫一次
+    idle_interval = 600                   # 非上课时段：每 10 分钟检查一次
+    cookie_refresh_interval = 6 * 3600    # 每 6 小时重新登录一次
+    last_login_time = time.time()
 
-    # 2. 获取学期 + 课程
-    try:
-        s_id, y_id = get_current_semester_info(cookie, log=print)
-        courses = get_courses(cookie, s_id, y_id, log=print)
-    except Exception as e:
-        print(f"❌ 拉取课程失败了呜呜呜: {e}")
-        sys.exit(1)
+    while True:
+        try:
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    if not courses:
-        print("⚠️ 主人的学期课表似乎是空的？")
-        sys.exit(0)
+            # ---- 非上课时段，休眠 ----
+            if not in_sign_window():
+                print(f"[{now}] 😴 当前是非上课时段呢，{idle_interval // 60} 分钟后再检查，zako先摸鱼啦~")
+                time.sleep(idle_interval)
+                continue
 
-    print(f"✅ 共 {len(courses)} 门课程，准备开始自动扫描签到喵！")
+            # ---- 定期刷新 Cookie ----
+            if time.time() - last_login_time > cookie_refresh_interval:
+                print(f"[{now}] 🔄 Cookie好像要过期了呢...正在重新登录获取新一批饼干喵~")
+                cookie, student_id = asyncio.run(login_and_get_cookie(log=print))
+                last_login_time = time.time()
+                if not cookie or not student_id:
+                    print("⚠️ 重新登录失败了呜呜，等待 5 分钟后重试")
+                    time.sleep(300)
+                    continue
 
-    # 3. 自动扫描
-    try:
-        results = auto_scan_all_courses(cookie, student_id, courses, log=print)
-    except Exception as e:
-        print(f"❌ 扫描出错了qwq: {e}")
-        sys.exit(1)
+            # ---- 拉取课程列表 ----
+            print(f"[{now}] 🔍 开始扫描，上班了呜呜呜...")
+            try:
+                s_id, y_id = get_current_semester_info(cookie, log=print)
+                courses = get_courses(cookie, s_id, y_id, log=print)
+            except Exception as e:
+                print(f"⚠️ 拉取课程的时候被赶出来了qwq：{e}")
+                time.sleep(300)
+                continue
 
-    # 4. 汇总
-    success = sum(1 for r in results if r.get("ok"))
-    print("\n" + "=" * 50)
-    print(f"🎉 完成啦！共 {len(courses)} 门课，成功签到 {success} 次")
-    sys.exit(0)
+            if not courses:
+                print("ℹ️ 主人的课程列表是空的呢~")
+                time.sleep(scan_interval)
+                continue
+
+            # ---- 执行扫描 ----
+            try:
+                auto_scan_all_courses(cookie, student_id, courses, log=print)
+            except Exception as e:
+                print(f"⚠️ 扫描的时候被错误绊倒了呜呜：{e}")
+
+            # ---- 等待下一次扫描 ----
+            print(f"[{now}] ⏰ 等待 {scan_interval} 秒后再扫描，zako先去休息一会喵~~")
+            time.sleep(scan_interval)
+
+        except KeyboardInterrupt:
+            print("\n 收到Ctrl+C信号，zako去睡觉啦~")
+            break
+        except Exception as e:
+            print(f"❌ 循环出错了呜呜: {e}")
+            time.sleep(300)
+
+def in_sign_window():
+    """当前是否处于上课时段（可能发生签到的时间）"""
+    from datetime import datetime
+    now = datetime.now().time()
+    windows = [
+        ("08:30", "10:05"),
+        ("10:25", "12:30"),
+        ("14:00", "15:35"),
+        ("15:55", "17:30"),
+    ]
+    for start_str, end_str in windows:
+        start = datetime.strptime(start_str, "%H:%M").time()
+        end = datetime.strptime(end_str, "%H:%M").time()
+        if start <= now <= end:
+            return True
+    return False
 
 # ==============================================================================
 # 入口
