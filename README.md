@@ -1,4 +1,5 @@
 ## 注意：只有zako_CHD.py适用于长安大学签到，其余均为原作者资产！
+## 经过修改之后，脚本能适应CHD的Tronclass系统，api调用经过初步验证，同时添加了一键扫描，使脚本能够在Liunx机器上定时自动扫描
 ## 以下均为原文档作者的Readme，咱不太想修改（纯懒ww）
 
 # xmu_rollcall_zako_Tronclass
