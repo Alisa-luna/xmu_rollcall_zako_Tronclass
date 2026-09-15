@@ -1,7 +1,7 @@
 # Zako 签到助手 · 开发说明与使用指导
 
 > 适用版本:Expo SDK 57 / React Native 0.86.3 / React 19.2.3
-> 项目位置:`D:\claude-code-haha\xmu_rollcall_mobile`
+> 项目位置:见下文"项目结构"
 
 ---
 
@@ -11,18 +11,18 @@
 
 | 命令 | 是什么 | 装在哪 |
 |---|---|---|
-| `bun` | JS 运行时 + 包管理器(类似 node + npm 二合一) | `C:\Users\yi'xuan\.bun\bin\bun.exe`(已在 PATH) |
+| `bun` | JS 运行时 + 包管理器(类似 node + npm 二合一) | 全局 bun 安装目录(已在 PATH) |
 | `bunx` | bun 自带的"临时下载并运行一个命令行工具"的命令(等价 npx) | 同上 |
 | `node` / `npm` | 传统 JS 运行时和包管理器 | 系统另装的 v24.18.0 |
 
 关键理解:**`bunx expo` 不是"安装了 expo 这个软件"**。它的行为是:
-1. 去 npm 仓库下载 expo 命令 → 存进全局缓存 `C:\Users\yi'xuan\.bun\install\cache`(不是当前目录)
+1. 去 npm 仓库下载 expo 命令 → 存进 bun 全局缓存(不是当前目录)
 2. 在当前目录寻找项目并运行
 
-**当前目录没有 package.json 就会报 ConfigError 退出**——这就是你在 `C:\Users\yi'xuan` 下运行 `bunx expo start` 失败的原因。它没有"不小心安装"任何东西到你的用户目录,只是没找到项目。**正确做法永远是:先 `cd` 进项目目录再运行。**
+**当前目录没有 package.json 就会报 ConfigError 退出**——这就是你在用户主目录下运行 `bunx expo start` 失败的原因。它没有"不小心安装"任何东西到你的用户目录,只是没找到项目。**正确做法永远是:先 `cd` 进项目目录再运行。**
 
 ```bash
-cd /d/claude-code-haha/xmu_rollcall_mobile   # 先回到项目目录
+cd <项目目录>   # 先回到项目目录
 bunx expo start --tunnel                     # 再运行
 ```
 
@@ -31,7 +31,7 @@ bunx expo start --tunnel                     # 再运行
 ### expo / eas / tsc 这些命令在项目里的位置
 
 项目安装依赖(`bun install`)后,命令实体在:
-- `D:\claude-code-haha\xmu_rollcall_mobile\node_modules\.bin\` 里(expo.exe、tsc.exe 等)
+- 项目目录的 `node_modules\.bin\` 里(expo.exe、tsc.exe 等)
 - `bunx` 会优先用这里的本地版本——**所以项目内运行和全局版本互不干扰,这是规范做法**
 
 ### 这些开发会在 C 盘留下哪些"合法"缓存(别误删,删了也能再生)
@@ -88,7 +88,7 @@ xmu_rollcall_mobile/
 ### 1. 日常改代码 → 手机即时预览(Expo Go)
 
 ```bash
-cd /d/claude-code-haha/xmu_rollcall_mobile
+cd <项目目录>
 bun run start -- --tunnel
 ```
 - `--tunnel` 走 Cloudflare 隧道,免配防火墙,手机 Expo Go 扫终端二维码即可
@@ -98,7 +98,7 @@ bun run start -- --tunnel
 ### 2. 出正式安装包(APK)
 
 ```bash
-cd /d/claude-code-haha/xmu_rollcall_mobile
+cd <项目目录>
 bunx eas build --platform android --profile preview
 ```
 - 云端构建,构建完给出 expo.dev 下载链接(链接约 14 天过期)
@@ -138,4 +138,4 @@ bunx expo-doctor              # 环境与依赖健康检查
 
 - **浏览器打开 expo.dev 提示"unusual traffic"**:是你本机出口 IP 被 Cloudflare 标记(换手机流量/换代理节点即可访问;APK 直链本身用其他网络下载正常)。
 - **npm 装包报 `Cannot convert object to primitive value`**:npm 12 的已知 bug,本项目一律用 `bun` / `bunx`,不要用裸 `npm install`。
-- **在 C:\Users\yi'xuan 里跑命令报 ConfigError**:没在项目目录,先 `cd` 回来。
+- **在用户主目录里跑命令报 ConfigError**:没在项目目录,先 `cd` 回来。
