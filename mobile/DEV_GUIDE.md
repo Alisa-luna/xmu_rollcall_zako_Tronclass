@@ -11,15 +11,15 @@
 
 | 命令 | 是什么 | 装在哪 |
 |---|---|---|
-| `bun` | JS 运行时 + 包管理器(类似 node + npm 二合一) | `C:\Users\yi'xuan\.bun\bin\bun.exe`(已在 PATH) |
+| `bun` | JS 运行时 + 包管理器(类似 node + npm 二合一) | `C:\Users\%USERPROFILE%\.bun\bin\bun.exe`(已在 PATH) |
 | `bunx` | bun 自带的"临时下载并运行一个命令行工具"的命令(等价 npx) | 同上 |
 | `node` / `npm` | 传统 JS 运行时和包管理器 | 系统另装的 v24.18.0 |
 
 关键理解:**`bunx expo` 不是"安装了 expo 这个软件"**。它的行为是:
-1. 去 npm 仓库下载 expo 命令 → 存进全局缓存 `C:\Users\yi'xuan\.bun\install\cache`(不是当前目录)
+1. 去 npm 仓库下载 expo 命令 → 存进全局缓存 `C:\Users\%USERPROFILE%\.bun\install\cache`(不是当前目录)
 2. 在当前目录寻找项目并运行
 
-**当前目录没有 package.json 就会报 ConfigError 退出**——这就是你在 `C:\Users\yi'xuan` 下运行 `bunx expo start` 失败的原因。它没有"不小心安装"任何东西到你的用户目录,只是没找到项目。**正确做法永远是:先 `cd` 进项目目录再运行。**
+**当前目录没有 package.json 就会报 ConfigError 退出**——这就是你在 `C:\Users\%USERPROFILE%` 下运行 `bunx expo start` 失败的原因。它没有"不小心安装"任何东西到你的用户目录,只是没找到项目。**正确做法永远是:先 `cd` 进项目目录再运行。**
 
 ```bash
 cd /d/claude-code-haha/xmu_rollcall_mobile   # 先回到项目目录
@@ -138,4 +138,4 @@ bunx expo-doctor              # 环境与依赖健康检查
 
 - **浏览器打开 expo.dev 提示"unusual traffic"**:是你本机出口 IP 被 Cloudflare 标记(换手机流量/换代理节点即可访问;APK 直链本身用其他网络下载正常)。
 - **npm 装包报 `Cannot convert object to primitive value`**:npm 12 的已知 bug,本项目一律用 `bun` / `bunx`,不要用裸 `npm install`。
-- **在 C:\Users\yi'xuan 里跑命令报 ConfigError**:没在项目目录,先 `cd` 回来。
+- **在 C:\Users\%USERPROFILE% 里跑命令报 ConfigError**:没在项目目录,先 `cd` 回来。
