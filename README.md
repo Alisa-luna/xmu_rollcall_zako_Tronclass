@@ -2,9 +2,7 @@
 ## 经过修改之后，脚本能适应CHD的Tronclass系统，api调用经过初步验证，同时添加了一键扫描，脚本支持在无UI环境下纯命令行运行（此时只支持自动定时扫描）
 ## 以下均为原文档作者的Readme，咱不太想修改（纯懒ww）
 
-# xmu_rollcall_zako_Tronclass
-厦门大学XMU畅课数字签到直接获取数字签到码，这是一个为 XMUer 打造的、基于 爬虫思路 开发的畅课（Tronclass）签到码自动化查询工具。主要是解放天天被你要签到码的同学喵！使用我们的zako_rocall就靠自己查正在进行的数字签到喵！
-# 🐾 zako_rollcall：厦大畅课签到码查询神器（V4 一键数字签到预览版）
+
 
 ---
 
@@ -214,12 +212,3 @@ https://www.reddit.com/r/PixelArt/comments/j2k28q/cat_girl_character_any_critici
 
 ---
 
-## ☕ 请作者喝杯奶茶
-
-如果这个项目对你有帮助，欢迎点个 Star，也可以请我喝一杯奶茶~
-
-<p align="center">
-  <img src="docs/alipay_qr.jpeg" width="220" alt="支付宝收款码">
-</p>
-
-> 赞赏纯属自愿，你的 Star 就是对项目最大的支持 ⭐
